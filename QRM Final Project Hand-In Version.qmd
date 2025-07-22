@@ -1,0 +1,986 @@
+---
+title: "Group 3 Project"
+author: "Haining Han, Yuting Bu, Zhiyuan Li, Changle Li"
+date: "DEC 6, 2024"
+format: 
+  beamer:
+    navigation: horizontal
+    theme: CambridgeUS
+#    theme: Montpellier
+    colortheme: spruce
+#    colortheme: lily
+    toc: true
+#    theme: ../slides.scss
+    slide-number: true
+    chalkboard: 
+      boardmarker-width: 5
+    transition: fade
+    background-transition: fade
+    highlight-style: ayu-mirage
+    editor: source
+---
+
+```{r, echo=FALSE, warning=FALSE}
+library(dynlm)
+library(tidyverse)
+library(tidyquant)
+library(tsibble)
+library(fable)
+library(feasts)
+library(forecast)
+library(vars)
+library(nnet)
+library(caret)
+library(tseries)
+library(ggplot2)
+library(lubridate)
+```
+
+# Topic: Forecasting Bond Yield Spread using Macroeconomic Factors
+
+## Why Focus on Bond Yield Spreads?
+
+Short-Term and Long-Term Effects:
+
+-   Reflects short-term monetary policy (e.g., Fed rate decisions) and long-term inflation/growth expectations
+
+Indicator of Economic Cycles:
+
+-   A narrowing or inverted spread predicts recessions.
+
+-   A widening spread signals economic growth.
+
+Policy and Market Interactions
+
+-   Captures feedback between monetary policy and market expectations.
+
+## How is the Spread Calculated?
+
+Formula:
+
+$$
+\text{Spread} = \text{10-Year Treasury Yield} - \text{2-Year Treasury Yield}
+$$
+
+Reflects:
+
+-   Short-Term Rates: Driven by central bank policies.
+-   Long-Term Rates: Influenced by inflation and growth outlooks.
+-   Macroeconomic Analysis: Predict future economic conditions.
+-   Monetary Policy Insight: Gauge the effectiveness of central bank interventions.
+-   Risk Management: Used by investors to identify market risk sentiment.
+
+# Data Selection and Cleaning
+
+## Data Selection and Cleaning
+
+Dependent Variables (1973.01.01 - 2023.12.31):
+
+-   10-Year minus 2-Year Treasury Yield Spread
+
+Independent Variables:
+
+-   CPIAUCSL: Consumer Price Index for All Urban Consumers
+-   PPIACO: Producer Price Index for All Commodities
+-   UNRATE: Unemployment Rate
+-   INDPRO: Industrial Production Index
+-   FEDFUNDS: Effective Federal Funds Rate
+-   VIXCLS: CBOE Volatility Index
+-   PAYEMS: Total Nonfarm Payrolls
+-   RECPROUSM156N: Recession Probabilities
+
+## Data Selection and Cleaning
+
+```{r, fig.height=5.5, fig.width=9, echo=FALSE, out.height="92%"}
+start_date <- "1973-01-01"
+end_date <- "2023-12-31"
+
+# Download the dependent variable (10Y-2Y Yield Spread)
+bond_data <- tq_get("T10Y2YM", from = start_date, to = end_date, get = "economic.data") %>%
+  rename(Date = date, T10Y2YM = price) %>%
+  mutate(Date = as.Date(format(Date, "%Y-%m-01"))) %>%
+  distinct(Date, .keep_all = TRUE)
+
+# Download macroeconomic variables
+macro_vars <- c("CPIAUCSL", "PPIACO", "UNRATE", "INDPRO", "FEDFUNDS", "VIXCLS", "PAYEMS", "RECPROUSM156N")
+macro_data <- tq_get(macro_vars, from = start_date, to = end_date, get = "economic.data") %>%
+  spread(symbol, price) %>%
+  rename(Date = date) %>%
+  mutate(Date = as.Date(format(Date, "%Y-%m-01"))) %>%
+  distinct(Date, .keep_all = TRUE)
+
+# Merge bond data and macro data
+data <- left_join(bond_data, macro_data, by = "Date") %>% drop_na()
+
+# Plot the original yield spread
+plot(data$Date, data$T10Y2YM, type = "l",
+     main = "Monthly 10Y-2Y Yield Spread",
+     xlab = "Date", ylab = "Spread (bps)",
+     col = "blue", lwd = 2)
+```
+
+## Check Stationarity and Seasonality
+
+```{r, echo=FALSE, fig.height=3}
+ts_data <- ts(data$T10Y2YM, start = c(1973, 1), frequency = 12)
+decomposed <- decompose(ts_data)
+plot(decomposed)
+par(mfrow = c(1, 2))
+acf(ts_data, main = "ACF of T10Y2YM")
+pacf(ts_data, main = "PACF of T10Y2YM")
+adf_test <- adf.test(ts_data)
+cat("ADF Test p-value on original data: ", adf_test$p.value, "\n")
+```
+
+## Apply Differencing and Re-Check
+
+```{r, echo=FALSE, fig.height=3}
+ts_data_diff <- diff(ts_data, differences = 1)
+plot(ts_data_diff, main = "First-Differenced 10Y-2Y Yield Spread",
+     ylab = "Differenced Values", xlab = "Time")
+par(mfrow = c(1, 2))
+acf(ts_data_diff, main = "ACF of Differenced T10Y2YM")
+pacf(ts_data_diff, main = "PACF of Differenced T10Y2YM")
+```
+
+# Model Fitting and Selection
+
+## Train-Test Split after CV on Original Data
+
+We split our training-testing data into 98% and 2%, because we would like to predict the bond-yield spread in short-term (near future analysis) for the next few months for better accuracy and economic intuition.
+
+```{r, echo=FALSE, fig.height=3}
+n <- nrow(data)
+train_size <- floor(0.98 * n)  
+test_size <- n - train_size
+train_data_orig <- data[1:train_size, ]
+test_data_orig <- data[(train_size+1):n, ]
+cat("Train size (original):", train_size, "\n")
+cat("Test size (original):", test_size, "\n")
+```
+
+## Cross-Validation
+
+Concept:
+
+Cross-validation (CV) is a technique used to evaluate the out-of-sample predictive performance of a model. Instead of using a single train-test split, CV systematically varies the portion of data used for training and testing to ensure a more reliable performance estimate.
+
+Intuition:
+
+-   In time series forecasting, we must respect the temporal order of data. Hence, we use a rolling or expanding window approach rather than shuffling the data.
+-   By repeatedly training on older data and testing on newer data, we assess how the model performs as time moves forward.
+-   This guards against overfitting and helps in selecting models and parameters that generalize well.
+
+## Cross-Validation
+
+Implementation Detail in Our Code:
+
+-   We defined an initial training window and then incrementally expanded or shifted it to generate multiple training and testing sets.
+-   By evaluating the performance (e.g., RMSE) on each split and averaging, we got a more stable estimate of how the model would perform on unseen data.
+-   This informed decisions on model selection and tuning before finalizing the forecasting approach.
+
+```{r, echo=FALSE, fig.height=3, warning=FALSE}
+data_ts <- train_data_orig %>% as_tsibble(index = Date)
+initial_window <- 200
+step_size <- 1
+cv_data <- data_ts %>%
+  stretch_tsibble(.init = initial_window, .step = step_size) %>%
+  filter(.id != max(.id))
+```
+
+## Model 1&2: TSLM
+
+Formula:
+$$
+\text{T10Y2YM}_t = \beta_0 + \sum_{j} \beta_j X_{j,t} + \epsilon_t
+$$
+where $X_{j,t}$ are the macroeconomic factors defined previously.
+
+Intuition:
+
+-   A TSLM is essentially a linear regression model applied to time series data.
+-   It uses economic indicators (inflation, unemployment, industrial production, interest rates, volatility, labor market, and recession probabilities) to explain the variation in the yield spread at time $ t $.
+-   By including these macroeconomic variables, the model attempts to capture broad economic conditions that influence short- and long-term interest rates.
+
+```{r, echo=FALSE, fig.height=3, results='hide'}
+train_ts_orig <- as_tsibble(train_data_orig, index = Date)
+test_ts_orig <- as_tsibble(test_data_orig, index = Date)
+
+model_1 <- train_ts_orig %>%
+  model(tslm = TSLM(T10Y2YM ~ CPIAUCSL + PPIACO + UNRATE + INDPRO + FEDFUNDS + VIXCLS + PAYEMS + RECPROUSM156N))
+
+fcast_model_1 <- model_1 %>% forecast(new_data = test_ts_orig)
+model_1_accuracy <- fcast_model_1 %>% accuracy(test_ts_orig)
+```
+
+## Model 1 Forecasting
+
+```{r, echo=FALSE, fig.height=3}
+autoplot(fcast_model_1) +
+  autolayer(test_ts_orig, T10Y2YM, color = "red") +
+  ggtitle("Model 1 (TSLM Original) Forecast vs Actual")
+model_1_accuracy <- fcast_model_1 %>% accuracy(test_ts_orig)
+model_1_rmse <- model_1_accuracy %>% dplyr::pull(RMSE)
+predictions <- fcast_model_1 %>% as_tibble() %>% dplyr::pull(.mean)
+actual <- test_ts_orig$T10Y2YM
+model_1_rsq <- cor(predictions, actual)^2
+cat("Model 1 Test RMSE:", model_1_rmse, "\n")
+cat("Model 1 Test R-squared:", model_1_rsq, "\n")
+```
+
+## Model 2: TSLM with Full Macro Set After Cross-Validation
+
+\fontsize{8}{9}\sf
+
+```{r, echo=FALSE, fig.height=3, warning=FALSE}
+fit_cv <- cv_data %>%
+  model(tslm = TSLM(T10Y2YM ~ CPIAUCSL + PPIACO + UNRATE + INDPRO + FEDFUNDS + VIXCLS + PAYEMS + RECPROUSM156N))
+fc_cv <- fit_cv %>% forecast(h = 1, new_data = cv_data)
+cv_accuracy <- fc_cv %>% accuracy(cv_data)
+print(cv_accuracy)
+
+test_ts <- as_tsibble(test_ts_orig, index = Date) %>%
+  mutate(.id = 1) %>%
+  as_tsibble(index = Date, key = .id)
+
+final_fc <- fit_cv %>% forecast(new_data = test_ts)
+final_accuracy <- final_fc %>% accuracy(test_ts)
+print(final_accuracy)
+```
+
+## Model 2 Forecasting
+
+```{r, echo=FALSE, fig.height=3, warning=FALSE}
+autoplot(final_fc) +
+  autolayer(test_ts, T10Y2YM, color = "red") +
+  ggtitle("Model 2 Forecast vs Actual")
+final_accuracy <- final_fc %>% accuracy(test_ts)
+final_rmse <- final_accuracy %>% dplyr::pull(RMSE)
+predictions <- final_fc %>% as_tibble() %>% dplyr::pull(.mean)
+actual <- test_ts$T10Y2YM
+final_rsq <- cor(predictions, actual)^2
+cat("Model 2 Test RMSE:", final_rmse, "\n")
+cat("Model 2 Test R-squared:", final_rsq, "\n")
+```
+
+## Model 3: ETS Model
+
+ETS Model Form:
+
+-   State space representation considering an error component, a trend component, and a seasonal component.
+
+Intuition:
+
+-   The ETS model decomposes the time series into underlying components (level, trend, seasonality).
+-   Although bond yields and spreads may have weaker seasonality, the ETS model can still capture evolving level and trend.
+-   Suitable for series that can be well-characterized by smooth changes over time rather than explicit external covariates.
+
+```{r, echo=FALSE, fig.height=3}
+ts_data_all <- data %>% as_tsibble(index = Date)
+ts_data_diff_all <- diff(ts_data_all$T10Y2YM, differences = 1)
+train_diff = ts_data_diff_all[1:train_size]
+test_diff <- ts_data_diff_all[(train_size+1):n]
+train_y = ts_data[1:train_size]
+test_y <- ts_data_diff_all[(train_size+1):n]
+
+ets_model <- ets(train_y)
+test_y <- na.omit(test_y)
+h <- length(test_y)
+ets_forecast <- forecast(ets_model, h = h)
+final_accuracy_ets <- ets_forecast %>% accuracy(test_y)
+```
+
+
+## Model 3: ETS Model
+
+\fontsize{8}{9}\sf
+
+```{r, echo=FALSE, fig.height=3}
+checkresiduals(ets_model)
+```
+
+## Model 3 Forecasting
+
+```{r, echo=FALSE, fig.height=3}
+plot(ets_forecast, main = "ETS Model Forecast vs Actual")
+lines(ts(test_y, start = time(ets_forecast$mean)[1], frequency = frequency(ets_forecast$mean)), 
+      col = "red", lty = 2, lwd = 2)
+legend("topleft", legend = c("Forecast", "Actual"), col = c("blue", "red"), lty = 1:2)
+# Extract predicted and actual values
+predicted_values <- ets_forecast$mean
+actual_values <- test_y
+ets_rmse <- sqrt(mean((predicted_values - actual_values)^2))
+ets_rsq <- cor(predicted_values, actual_values, use = "complete.obs")^2
+cat("ETS Test RMSE:", ets_rmse, "\n")
+cat("ETS Test R-squared:", ets_rsq, "\n")
+```
+
+## Model 4: ARIMA Model
+
+General ARIMA(p,d,q) Formula:
+$$
+(1 - \phi_1 B - \cdots - \phi_p B^p)(\nabla^d \text{T10Y2YM}_t) = (1 + \theta_1 B + \cdots + \theta_q B^q)\epsilon_t
+$$
+
+Intuition:
+
+-   ARIMA models time series data based solely on its own historical values, differences, and past forecast errors.
+-   It does not explicitly use macroeconomic predictors.
+-   The goal is to capture patterns like trend, autocorrelation, and mean reversion in the yield spread, relying on past behavior to predict the future.
+
+## Model 4: ARIMA Model
+
+\fontsize{8}{9}\sf
+
+```{r, echo=FALSE, fig.height=3, warning=FALSE}
+arima_model <- auto.arima(train_diff, seasonal = TRUE, stepwise = TRUE, approximation = FALSE)
+summary(arima_model)
+```
+
+```{r, echo=FALSE, fig.height=3, warning=FALSE}
+test_diff <- na.omit(test_diff)
+arima_forecast <- arima_model %>% forecast(new_data = test_diff)
+final_accuracy_arima <- arima_forecast %>% accuracy(test_diff)
+final_accuracy_arima
+```
+
+## Model 4: ARIMA Model
+
+\fontsize{8}{9}\sf
+
+```{r, echo=FALSE, fig.height=3}
+checkresiduals(arima_model)
+```
+
+## Model 4 Forecasting
+
+```{r, echo=FALSE, fig.height=3}
+plot(arima_forecast, main = "ARIMA Model Forecast vs Actual")
+lines(ts(test_diff, start = time(arima_forecast$mean)[1], frequency = frequency(arima_forecast$mean)), 
+      col = "red", lty = 2, lwd = 2)
+legend("topleft", legend = c("Forecast", "Actual"), col = c("blue", "red"), lty = 1:2)
+arima_forecast <- forecast(arima_model, h = length(test_diff))
+predicted_values <- arima_forecast$mean
+actual_values <- test_diff
+arima_rmse <- sqrt(mean((predicted_values - actual_values)^2))
+arima_rsq <- cor(predicted_values, actual_values)^2
+
+cat("ARIMA Test RMSE:", arima_rmse, "\n")
+cat("ARIMA Test R-squared:", arima_rsq, "\n")
+```
+
+## Model 5: Linear Regression with ARIMA Error
+
+\fontsize{8}{9}\sf
+
+```{r, echo=FALSE, fig.height=3}
+train_ts_orig_fill <- train_ts_orig %>%
+  mutate(Date = yearmonth(Date)) %>%
+  as_tsibble(index = Date) %>%
+  fill_gaps()
+
+train_ts_orig_fill <- train_ts_orig_fill %>%
+  mutate(symbol = "T10Y2YM")
+
+fit <- train_ts_orig_fill%>% model(ARIMA(T10Y2YM ~ CPIAUCSL + PPIACO + UNRATE + INDPRO + FEDFUNDS + VIXCLS + PAYEMS + RECPROUSM156N))
+
+report(fit)
+```
+
+## Model 5: Linear Regression with ARIMA Error
+
+\fontsize{8}{9}\sf
+
+```{r, echo=FALSE, fig.height=3}
+ggplot(augment(fit), aes(x = Date, y = .resid)) +
+  geom_line() +                   
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Regression Errors",
+       x = "Date",
+       y = "Residuals") +
+  theme_minimal()
+augment(fit) %>%features(.innov, ljung_box, dof = 1, lag = 12)
+```
+
+```{r, echo=FALSE, fig.height=3}
+test_ts_orig_fill <- test_ts_orig %>%
+  bind_rows(
+    tibble(
+      symbol = "T10Y2YM",
+      Date = yearmonth("2023 Apr"),
+      T10Y2YM = NA,
+      CPIAUCSL = NA,
+      FEDFUNDS = NA,
+      INDPRO = NA,
+      PAYEMS = NA,
+      PPIACO = NA,
+      RECPROUSM156N = NA,
+      UNRATE = NA,
+      VIXCLS = NA
+    )
+  ) %>%
+  arrange(Date)
+
+test_ts_orig_fill <- test_ts_orig_fill %>%
+  mutate(Date = yearmonth(Date)) %>%
+  as_tsibble(index = Date) %>%
+  fill_gaps()
+
+fcst <- forecast(fit, new_data = test_ts_orig_fill)
+final_accuracy <- fcst %>% accuracy(test_ts_orig_fill)
+results <- fcst %>%
+  as_tibble() %>%
+  rename(pred = .mean) %>%
+  left_join(test_ts_orig_fill %>% as_tibble(), by = "Date") 
+
+results_clean <- results %>%
+  filter(!is.na(pred), !is.na(T10Y2YM.y))
+
+R2 <- cor(results_clean$pred, results_clean$T10Y2YM.y)^2
+cat("Linear Regression with ARIMA Error RMSE: ", final_accuracy$RMSE, "\n")
+cat("Linear Regression with ARIMA Error R-squared:", R2, "\n")
+```
+
+## Model 5 Forecasting
+
+\fontsize{8}{9}\sf
+
+```{r, echo=FALSE, fig.height=3}
+ggplot(results_clean, aes(x = Date)) +
+  geom_line(aes(y = T10Y2YM.y, color = "Actual")) +
+  geom_line(aes(y = pred, color = "Predicted")) +
+  labs(title = "Model 5 Actual vs Predicted", y = "T10Y2YM") +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red"))
+```
+
+## PCA (Principal Component Analysis)
+
+Concept:
+Principal Component Analysis (PCA) is a dimensionality reduction technique. It transforms a set of possibly correlated variables into a smaller set of uncorrelated variables called Principal Components (PCs).
+
+Formula:
+Given a standardized data matrix $X$ (with zero mean and unit variance), PCA solves:
+$$
+X^\top X v = \lambda v
+$$
+where $v$ is an eigenvector and $\lambda$ is the associated eigenvalue. Each eigenvector corresponds to a principal component, and the eigenvalues measure the amount of variance explained by that component.
+
+## PCA (Principal Component Analysis)
+
+Intuition:
+
+-   PCA identifies directions in the data that capture the most variance.
+-   By focusing on the first few principal components (the ones with the largest eigenvalues), we retain the most important information while reducing the dimensionality of our dataset.
+-   This helps mitigate multicollinearity, improve model stability, and potentially enhance predictive accuracy.
+
+Relevance to Our Project:
+
+-   We applied PCA to a range of macroeconomic factors.
+-   By using just the top few principal components, we incorporate the majority of the essential economic signals with fewer parameters.
+-   This can lead to a more robust forecasting model for the yield spread.
+
+## PCA Transformation Setup
+
+\fontsize{8}{9}\sf
+
+```{r, echo=FALSE, fig.height=3}
+data_no_symbol <- data[, colnames(data) != "symbol"]
+data_no_yield <- data_no_symbol[, !colnames(data_no_symbol) %in% "T10Y2YM"]
+standardized_data <- data_no_yield %>%
+  mutate(across(where(is.numeric), ~ as.numeric(scale(.))))
+
+data_no_date <- standardized_data[, !colnames(standardized_data) %in% "Date"]
+pca_model <- prcomp(data_no_date, center = TRUE, scale. = TRUE)
+summary(pca_model)
+
+# Select top 4 principal components
+pca_transformed_data <- data.frame(pca_model$x[, 1:4])
+colnames(pca_transformed_data) <- c("PC1","PC2","PC3","PC4")
+
+# Add back T10Y2YM and Date
+pca_transformed_data <- cbind(T10Y2YM = data_no_symbol$T10Y2YM, pca_transformed_data)
+pca_transformed_data <- cbind(Date = standardized_data$Date, pca_transformed_data)
+pca_transformed_data <- pca_transformed_data %>%
+  mutate(T10Y2YM_future = dplyr::lead(T10Y2YM, 1)) %>%
+  drop_na(T10Y2YM_future)
+final_data <- left_join(pca_transformed_data, data, by = "Date", suffix = c("", "_orig"))
+if("T10Y2YM_orig" %in% colnames(final_data)) {
+  final_data <- final_data %>% dplyr::select(-T10Y2YM_orig)
+}
+final_data <- final_data[order(final_data$Date), ]
+pca_ts <- as_tsibble(final_data, index = Date)
+```
+
+## Re-Split Training and Testing Data and Perform CV Again
+
+\fontsize{8}{9}\sf
+
+We re-split our training-testing data into 98% and 2% again, because we are predicting the bond-yield spread in short-term (near future analysis) for the next few months for better accuracy and economic intuition. Under PCA transformation, we would expect the result to become better.
+
+```{r, echo=FALSE, fig.height=3,warning=FALSE}
+train_size <- floor(0.98 * nrow(pca_ts))
+pca_train <- pca_ts[1:train_size, ]
+pca_test <- pca_ts[(train_size + 1):nrow(pca_ts), ]
+## Cross-Validation on PCA data
+initial_window <- 200
+step_size <- 1
+cv_data_pca <- pca_train[-1,] %>%
+  stretch_tsibble(.init = initial_window, .step = step_size) %>%
+  filter(.id != max(.id))
+```
+
+## Model 6: TSLM with Full Macro Set Using PCA Components with CV
+
+Formula:
+$$
+\text{T10Y2YM}_t = \beta_0 + \beta_1 \text{PC1}_t + \beta_2 \text{PC2}_t + \beta_3 \text{PC3}_t + \beta_4 \text{PC4}_t + \epsilon_t
+$$
+
+Intuition:
+
+-   Principal Component Analysis (PCA) condenses the information from multiple correlated macroeconomic variables into a few uncorrelated components (PC1, PC2, etc.).
+-   By using PCs instead of raw macro data, we reduce dimensionality and potential multicollinearity, aiming to improve model stability and forecast accuracy.
+
+```{r, echo=FALSE, fig.height=3, results='hide', warning=FALSE}
+fit_cv_pca <- cv_data_pca %>%
+  model(tslm = TSLM(T10Y2YM ~ PC1 + PC2 + PC3 + PC4))
+
+fc_cv_pca <- fit_cv_pca %>% forecast(h = 1, new_data = cv_data_pca)
+cv_accuracy_pca <- fc_cv_pca %>% accuracy(cv_data_pca)
+print(cv_accuracy_pca)
+
+pca_test <- pca_test %>% mutate(.id = 1) %>%
+  as_tsibble(index = Date, key = .id)
+
+final_fc_pca <- fit_cv_pca %>% forecast(new_data = pca_test)
+final_accuracy_pca <- final_fc_pca %>% accuracy(pca_test)
+print(final_accuracy_pca)
+```
+
+## Model 6 Forecasting
+
+```{r, echo=FALSE, fig.height=3}
+autoplot(final_fc_pca) +
+  autolayer(pca_test, T10Y2YM, color = "red") +
+  ggtitle("Model 6 (TSLM PCA) Forecast vs Actual")
+final_accuracy_pca <- final_fc_pca %>% accuracy(pca_test)
+final_rmse_pca <- final_accuracy_pca %>% dplyr::pull(RMSE)
+predictions_pca <- final_fc_pca %>% as_tibble() %>% dplyr::pull(.mean)
+actual_pca <- pca_test$T10Y2YM
+final_rsq_pca <- cor(predictions_pca, actual_pca)^2
+cat("Model 6 Test RMSE:", final_rmse_pca, "\n")
+cat("Model 6 Test R-squared:", final_rsq_pca, "\n")
+```
+
+## Model 7: Regular Linear Regression with Principal Components Without CV
+
+Formula:
+$$
+\text{T10Y2YM}_t = \beta_0 + \beta_1 \text{PC1}_t + \beta_2 \text{PC2}_t + \beta_3 \text{PC3}_t + \beta_4 \text{PC4}_t + \epsilon_t
+$$
+
+Intuition:
+
+-   This is a standard OLS regression model (not explicitly time-series aware) using the PCs as predictors.
+-   The goal is to see how a simple linear model performs when using dimensionally reduced features, potentially capturing the underlying economic structure more effectively.
+
+```{r, echo=FALSE, fig.height=3}
+lm_model <- lm(T10Y2YM ~ PC1 + PC2 + PC3 + PC4, data = cv_data_pca)
+lm_predictions <- predict(lm_model, newdata = pca_test)
+lm_rmse <- sqrt(mean((lm_predictions - pca_test$T10Y2YM)^2))
+lm_rsq <- cor(lm_predictions, pca_test$T10Y2YM)^2
+```
+
+## Model 7 Forecasting
+
+```{r, echo=FALSE, fig.height=3}
+lm_predictions <- predict(lm_model, newdata = pca_test)
+plot_df <- data.frame(Date = pca_test$Date, Actual = pca_test$T10Y2YM, Forecast = lm_predictions)
+ggplot(plot_df, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Forecast, color = "Forecast")) +
+  ggtitle("Model 7 (LM with PCs) Forecast vs Actual") +
+  scale_color_manual(values = c("red","blue"))
+cat("Linear Regression Test RMSE: ", lm_rmse, "\n")
+cat("Linear Regression Test R-squared: ", lm_rsq, "\n")
+```
+
+## Model 8: Dynamic Regression with Lags
+
+Formula (example):
+$$
+\text{T10Y2YM}_t = \beta_0 + \beta_1 \text{PC1}_t + \beta_2 \text{PC2}_t + \beta_3 \text{PC3}_t + \beta_4 \text{PC4}_t + \beta_5 \text{T10Y2YM}_{t-1} + \cdots + \epsilon_t
+$$
+
+Intuition:
+
+-   Dynamic regression incorporates lagged values of the dependent variable (and possibly the predictors).
+-   This captures persistence and memory in the yield spread, recognizing that today’s spread may depend on past spreads and past economic conditions.
+-   By including lags, we aim to improve short-term forecasts by leveraging the serial correlation often present in financial time series.
+
+```{r, echo=FALSE, fig.height=3, results='hide'}
+lag_order <- 3
+train_data_lagged <- cv_data_pca
+for (i in 1:lag_order) {
+  train_data_lagged[[paste0("PC1_lag", i)]] <- dplyr::lag(train_data_lagged$PC1, i)
+  train_data_lagged[[paste0("PC2_lag", i)]] <- dplyr::lag(train_data_lagged$PC2, i)
+  train_data_lagged[[paste0("PC3_lag", i)]] <- dplyr::lag(train_data_lagged$PC3, i)
+  train_data_lagged[[paste0("PC4_lag", i)]] <- dplyr::lag(train_data_lagged$PC4, i)
+  train_data_lagged[[paste0("T10Y2YM_lag", i)]] <- dplyr::lag(train_data_lagged$T10Y2YM, i)
+}
+train_data_lagged <- na.omit(train_data_lagged)
+```
+
+```{r}
+dynamic_formula <- T10Y2YM ~ PC1 + PC2 + PC3 + PC4 + PC1_lag1 + PC2_lag1 + PC3_lag1 + PC4_lag1 + T10Y2YM_lag1
+dynamic_model <- dynlm(dynamic_formula, data = train_data_lagged)
+```
+
+```{r}
+test_data_lagged <- pca_test
+for (i in 1:lag_order) {
+  test_data_lagged[[paste0("PC1_lag", i)]] <- dplyr::lag(test_data_lagged$PC1, i)
+  test_data_lagged[[paste0("PC2_lag", i)]] <- dplyr::lag(test_data_lagged$PC2, i)
+  test_data_lagged[[paste0("PC3_lag", i)]] <- dplyr::lag(test_data_lagged$PC3, i)
+  test_data_lagged[[paste0("PC4_lag", i)]] <- dplyr::lag(test_data_lagged$PC4, i)
+  test_data_lagged[[paste0("T10Y2YM_lag", i)]] <- dplyr::lag(test_data_lagged$T10Y2YM, i)
+}
+test_data_lagged <- na.omit(test_data_lagged)
+dynamic_predictions <- predict(dynamic_model, newdata = test_data_lagged)
+dynamic_rmse <- sqrt(mean((dynamic_predictions - test_data_lagged$T10Y2YM)^2))
+dynamic_rsq <- cor(dynamic_predictions, test_data_lagged$T10Y2YM)^2
+```
+
+## Model 8 Forecasting
+
+```{r, echo=FALSE, fig.height=3}
+plot_df <- data.frame(Date = test_data_lagged$Date, Actual = test_data_lagged$T10Y2YM, Forecast = dynamic_predictions)
+ggplot(plot_df, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Forecast, color = "Forecast")) +
+  ggtitle("Model 8 (Dynamic Regression) Forecast vs Actual") +
+  scale_color_manual(values = c("red","blue"))
+cat("Dynamic Regression RMSE: ", dynamic_rmse, "\n")
+cat("Dynamic Regression R-squared:", dynamic_rsq, "\n")
+```
+
+
+## Model 9: VAR and Impulse Response Functions (IRFs)
+
+Formula for VAR(1):
+$$
+y_t = \mu + A y_{t-1} + \varepsilon_t
+$$
+
+-   $y_t$: Vector of endogenous variables (e.g., yield spread and PCA components).
+-   $A$: Coefficient matrix capturing how past values affect current values.
+-   $\mu$: Intercept (drift) term.
+-   $\varepsilon_t \sim N(0,\Omega)$: White noise error term with variance-covariance matrix $\Omega$.
+
+## Model 9: VAR and Impulse Response Functions (IRFs)
+
+Intuition:
+
+-   The VAR model allows us to analyze dynamic relationships among multiple time series variables.
+-   By treating all variables as endogenous, the VAR captures feedback loops and interdependencies without imposing a priori causal orderings.
+-   Once estimated, we can convert the VAR into its Moving Average (MA) representation to understand how shocks propagate.
+
+## Impulse Response Functions (IRFs):
+
+-   The IRF traces the effect of a one-time, unit shock to one variable on the future values of all variables in the system.
+-   Formally, the MA representation of the VAR is:
+$$
+(y_t - c) = \sum_{i=0}^{\infty} \Psi_i \varepsilon_{t-i}
+$$
+-   Here, $\Psi_i = A^i$ and $c = (I_m - A)^{-1}\mu$.
+
+Definition of IRF:
+
+-   The IRF at horizon $i$ for a shock at time $t$ is:
+$$
+\text{IRF}_i = \Psi_i \cdot \varepsilon_t
+$$
+-   $\Psi_i$ measures how a current shock influences the system’s variables $i$ periods ahead.
+
+## Impulse Response Functions (IRFs):
+
+Interpretation:
+
+-   IRFs show how a single shock affects the trajectory of each variable over time.
+-   They help assess dynamic relationships, such as how a monetary policy shock (represented by a disturbance in one factor) influences the yield spread and other macro indicators over subsequent months.
+-   Policymakers and analysts use IRFs to understand the speed, magnitude, and duration of the responses, providing valuable insights into economic policy effects and risk management strategies.
+
+## Model 9: Impulse Response Function (IRF) with PCs
+
+\fontsize{8}{9}\sf
+
+```{r, echo=FALSE, results='hide'}
+
+
+lagged_data <- as.data.frame(pca_ts)[-1, ]  # Convert to data.frame if needed
+# Create a TS object for VAR (use only training portion of lagged_data)
+train_lagged <- lagged_data[1:train_size, ]
+test_lagged <- lagged_data[(train_size + 1):nrow(lagged_data), ]
+
+train_ts_for_var <- ts(train_lagged[, c("T10Y2YM", "PC1", "PC2", "PC3", "PC4")],
+                       start = c(1973, 2), # Adjust as appropriate
+                       frequency = 12)
+
+lag_selection <- VARselect(train_ts_for_var, lag.max = 12, type = "const")
+best_lag <- lag_selection$selection["AIC(n)"]
+var_model <- vars::VAR(train_ts_for_var, p = best_lag, type = "const")
+summary(var_model)
+
+stability_check <- stability(var_model)
+plot(stability_check)
+
+var_forecast <- predict(var_model, n.ahead = 12)
+print(var_forecast)
+
+pairs <- list(
+  c("PC1","PC2"),
+  c("PC1","PC3"),
+  c("PC1","PC4"),
+  c("PC2","PC3"),
+  c("PC2","PC4"),
+  c("PC3","PC4")
+)
+
+irf_results <- purrr::map_df(pairs, function(p) {
+  impulse_var <- p[1]
+  response_var <- p[2]
+  
+  irf_res <- irf(var_model, impulse = impulse_var, response = response_var, n.ahead = 12, boot = TRUE)
+  response_values <- irf_res$irf[[impulse_var]][, response_var, drop = TRUE]
+  
+  data.frame(
+    Period = 1:length(response_values),
+    Response = response_values,
+    Pair = paste0(impulse_var, " -> ", response_var)
+  )
+})
+```
+
+```{r, echo=FALSE}
+ggplot(irf_results, aes(x = Period, y = Response)) +
+  geom_line(color = "blue") +
+  facet_wrap(~ Pair, nrow = 3, ncol = 2, scales = "free_y") +
+  labs(title = "Impulse Response Functions", x = "Periods", y = "Response") +
+  theme_minimal()
+fevd_res <- fevd(var_model, n.ahead = 12)
+```
+
+## Model 9 Forecasting
+
+```{r, echo=FALSE,warning=FALSE, fig.height=3}
+h <- nrow(test_lagged)
+var_forecast <- predict(var_model, n.ahead = h)
+var_preds <- var_forecast$fcst$T10Y2YM[,"fcst"]
+actual_var <- test_lagged$T10Y2YM
+var_rmse <- sqrt(mean((var_preds - actual_var)^2))
+var_rsq <- cor(var_preds, actual_var)^2
+
+# Plot using pca_test for dates (since pca_test should align with test_lagged)
+pca_test_dates <- pca_test$Date[1:length(actual_var)]  # since actual_var has length 5
+plot_df <- data.frame(
+  Date = pca_test_dates,
+  Actual = actual_var,
+  Forecast = var_preds
+)
+
+ggplot(plot_df, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Forecast, color = "Forecast")) +
+  ggtitle("Model 8 (VAR) Forecast vs Actual") +
+  scale_color_manual(values = c("red","blue")) +
+  theme_minimal()
+
+cat("Model 9 (VAR) Test RMSE:", var_rmse, "\n")
+cat("Model 9 (VAR) Test R-squared:", var_rsq, "\n")
+```
+
+
+## Model 10: Neural Network using PCs
+
+\fontsize{8}{9}\sf
+
+Conceptual Representation:
+$$
+\hat{y}_t = f(W_2 \cdot \sigma(W_1 X_t + b_1) + b_2)
+$$
+where $X_t$ are the PCs and $\sigma$ is a nonlinear activation function.
+
+Intuition:
+
+-   A feed-forward neural network learns complex nonlinear relationships between the macroeconomic principal components and the yield spread.
+-   Unlike linear models, NN can capture nonlinear patterns and interactions, potentially improving forecasting accuracy if these complexities exist in the data.
+-   The black-box nature requires careful tuning and validation.
+
+## Model 10 Forecasting
+
+\fontsize{8}{9}\sf
+
+```{r, echo=FALSE, fig.height=3, results='hide'}
+final_data <- final_data %>%
+  mutate(T10Y2YM_future = dplyr::lead(T10Y2YM, 1)) %>%
+  drop_na(T10Y2YM_future)
+
+train_nn_data <- final_data[1:train_size, ]
+test_nn_data <- final_data[(train_size + 1):nrow(final_data), ]
+```
+
+```{r, echo=FALSE, fig.height=3}
+set.seed(1234)
+
+x_train <- as.matrix(train_nn_data[, c("PC1", "PC2", "PC3", "PC4")])
+y_train <- train_nn_data$T10Y2YM_future
+
+x_test <- as.matrix(test_nn_data[, c("PC1", "PC2", "PC3", "PC4")])
+y_test <- test_nn_data$T10Y2YM_future
+
+train_control <- trainControl(method = "cv", number = 10)
+
+tune_grid <- expand.grid(size = c(10, 20, 50), decay = c(0.01, 0.1, 0.5))
+
+model_nn <- train(
+  T10Y2YM_future ~ .,
+  data = data.frame(x_train, T10Y2YM_future = y_train),
+  method = "nnet",
+  trControl = train_control,
+  tuneGrid = tune_grid,
+  linout = TRUE,
+  trace = FALSE
+)
+
+train_predictions <- predict(model_nn, newdata = data.frame(x_train))
+train_rmse <- sqrt(mean((train_predictions - y_train)^2))
+train_rsq <- cor(train_predictions, y_train)^2
+
+test_predictions <- predict(model_nn, newdata = data.frame(x_test))
+test_rmse <- sqrt(mean((test_predictions - y_test)^2))
+test_rsq <- cor(test_predictions, y_test)^2
+
+plot_df <- data.frame(
+  Date = test_nn_data$Date,
+  Actual = y_test,
+  Forecast = test_predictions
+)
+
+ggplot(plot_df, aes(x = Date)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Forecast, color = "Forecast")) +
+  ggtitle("Model 10 (Neural Network with PCs) Forecast vs Actual") +
+  scale_color_manual(values = c("red", "blue")) +
+  theme_minimal()
+cat("Train RMSE:", train_rmse, "\n")
+cat("Train R-squared:", train_rsq, "\n")
+cat("Test RMSE:", test_rmse, "\n")
+cat("Test R-squared:", test_rsq, "\n")
+```
+
+# Conclusion
+
+## Conclusion
+
+\fontsize{8}{9}\sf
+
+```{r, echo=FALSE, fig.height=3}
+results <- tibble(
+  Model = c("Model 1 (TSLM Original)",
+            "Model 2 (TSLM Full Macro after CV)",
+            "Model 3 (ETS)",
+            "Model 4 (ARIMA)",
+            "Model 5 (Linear Regression with ARIMA Error)",
+            "Model 6 (TSLM with PCs + CV)",
+            "Model 7 (Regular LM with PCs)",
+            "Model 8 (Dynamic Regression with PCs)",
+            "Model 9 (VAR with PCs)",
+            "Model 10 (Neural Network using PCs)"),
+  RMSE = c(model_1_rmse,
+           final_rmse,
+           ets_rmse,
+           arima_rmse,
+           final_accuracy$RMSE,
+           final_rmse_pca,
+           lm_rmse,
+           dynamic_rmse,
+           var_rmse,
+           test_rmse),
+  R_squared = c(round(model_1_rsq, 4),
+                round(final_rsq, 4),
+                round(ets_rsq, 4),
+                round(arima_rsq, 4),
+                round(R2,4),
+                round(final_rsq_pca, 4),
+                round(lm_rsq, 4),
+                round(dynamic_rsq, 4),
+                round(var_rsq, 4),
+                round(test_rsq, 4))
+)
+results
+```
+
+## Conclusion
+
+\fontsize{8}{9}\sf
+
+1. Overall Comparison:
+
+We evaluated a variety of models to forecast the 10Y-2Y Treasury yield spread, ranging from traditional time-series methods to models incorporating macroeconomic factors and principal components (PCs). Each model’s Root Mean Squared Error (RMSE) measures forecast accuracy, while R-squared ($R^2$) indicates the proportion of variance in the spread explained by the model.
+
+2. Traditional and Basic Macro Models:
+
+TSLM models with original or expanded macro variables (Models 1 & 2) explain a moderate portion of the variance in the yield spread but fail to achieve precise forecasts. Simply adding more macro factors does not necessarily improve predictive performance.
+
+3. Pure Time-Series Approaches (ETS & ARIMA):
+
+Models relying solely on time-series patterns (Models 3 & 4) significantly improve forecast accuracy. ARIMA, in particular, attains a very low RMSE, indicating strong short-term predictive power. However, these models offer less insight into the underlying macroeconomic drivers of the yield spread, as reflected by relatively low $R^2$ values.
+
+## Conclusion
+
+\fontsize{8}{9}\sf
+
+4. Combining Regression and Time-Series (Linear Regression with ARIMA Errors):
+
+Integrating structural (regression-based) information with ARIMA errors (Model 5) balances decent explanatory power with improved accuracy. This approach shows that leveraging macro factors alongside time-series error structures can yield both interpretable and fairly accurate results.
+
+5. Introducing Principal Components (PCA-Based Models):
+
+Using principal components derived from multiple macroeconomic variables (Models 6 & 7) reduces forecast errors compared to the original TSLM but substantially lowers the explained variance. Thus, while PCA captures broad economic signals, simply plugging PCs into a static linear model does not translate into clearer economic interpretation or superior explanatory strength.
+
+6. Dynamic Regression with PCs (Model 8):
+
+The standout model incorporates dynamic regression with PCs. It achieves a nearly optimal balance, offering both exceptionally low forecast error and the highest $R^2$. This suggests that combining lag structures and latent macroeconomic factors (via PCA) can capture the underlying economic dynamics most effectively, making this model ideal for both prediction and understanding.
+
+
+
+## Conclusion
+
+\fontsize{8}{9}\sf
+
+7. VAR and Neural Network Approaches (Models 9 & 10):
+
+The VAR with PCs model reaches the lowest RMSE overall, confirming its capacity for highly accurate predictions. However, its moderate $R^2$ indicates limited explanatory insight compared to the dynamic regression model. The neural network also produces respectable accuracy but provides minimal explanation for the variance in the yield spread, highlighting that complexity and nonlinearity do not guarantee economic interpretability.
+
+In Summary:
+
+For practitioners and researchers who value both predictive accuracy and a solid connection to underlying economic factors, the dynamic regression model with principal components (Model 8) emerges as the top choice. If the primary objective is to minimize forecast error regardless of interpretability, the VAR with PCs (Model 9) is an excellent alternative. The overall findings emphasize that while pure statistical or machine learning models can achieve remarkable accuracy, models incorporating economic structure and latent factors can yield valuable insights into the fundamental drivers of the yield curve’s behavior.
+
+## Conclusion
+
+\fontsize{8}{9}\sf
+
+Economic and Methodological Insights:
+
+-   Incorporating macroeconomic variables or principal components (PCs) from economic indicators does not guarantee improved forecasting or explanatory power by default. For instance, while the ARIMA model lacks a clear economic narrative, it still produced highly accurate short-term predictions.
+
+-   The dynamic regression model, which integrates PCs and lagged values, stands out by delivering both strong predictive accuracy and robust explanatory capability. This outcome suggests the 10Y-2Y yield spread is influenced by a blend of its own historical dynamics and broad economic factors distilled into PCs.
+
+-   More complex approaches, such as VAR and neural networks, demonstrated mixed results. The VAR model achieved exceptionally low forecast errors but captured less underlying variance than the dynamic regression model. Meanwhile, the neural network, despite its complexity, did not surpass simpler methods in terms of explaining the fundamental economic relationships driving the spread.
+
+# Reference
+
+## Reference
+
+- Diebold, F. X., Rudebusch, G. D., & Aruoba, B. (2006). "The Macroeconomy and the Yield Curve."
+- Federal Reserve Bank of San Francisco Research.
